@@ -51,13 +51,6 @@ unsigned int readDistanceCM(int trigPin, int echoPin) {
   return cm;
 }
 
-void clearAllLights() {
-  for (int i=0;i<numRoads;i++){
-    digitalWrite(lightPins[i][0], HIGH); // RED off? depends on wiring; we'll use common-cathode active LOW? 
-    // We'll explicitly set pattern when needed. For simplicity use HIGH=OFF, LOW=ON below.
-  }
-}
-
 // Show a number on a TM1637 display, showing up to 4 digits
 void showNumberTM(int idx, int val) {
   if (val < 0) val = 0;
@@ -70,7 +63,7 @@ void setup() {
   for (int i=0;i<numRoads;i++){
     for (int j=0;j<3;j++){
       pinMode(lightPins[i][j], OUTPUT);
-      digitalWrite(lightPins[i][j], HIGH); // OFF (assuming active LOW LED wiring through resistor to 5V common)
+      digitalWrite(lightPins[i][j], LOW); // Start with all OFF
     }
   }
   // Ultrasonic pins
@@ -84,11 +77,20 @@ void setup() {
   // Displays init
   for (int i=0;i<numRoads;i++){
     displays[i].setBrightness(6); // 0..7
-    showNumberTM(i, baseGreen);
+    showNumberTM(i, 0);
   }
   // Serial for debug
-  Serial.begin(115200);
-  delay(200);
+  Serial.begin(9600);
+  delay(1000);
+  Serial.println("=== Traffic System Started ===");
+  Serial.println("Testing LED wiring...");
+  Serial.println("If LEDs are ON when they should be OFF, you need to swap HIGH/LOW in code");
+  
+  // Test: Turn on only RED lights to verify wiring
+  delay(2000);
+  Serial.println("All RED lights should be ON now for 3 seconds...");
+  allRed();
+  delay(3000);
 }
 
 // Count vehicles during sampling window by polling all sensors frequently
@@ -115,10 +117,13 @@ void sampleCounts() {
     }
   }
   // debug
-  Serial.print("Counts: ");
+  Serial.print("Vehicle Counts: ");
   for (int i=0;i<numRoads;i++) {
+    Serial.print("Road ");
+    Serial.print(char('A' + i));
+    Serial.print("=");
     Serial.print(counts[i]);
-    Serial.print(i < numRoads-1 ? "," : "\n");
+    Serial.print(i < numRoads-1 ? ", " : "\n");
   }
 }
 
@@ -129,75 +134,179 @@ void computeAllocation() {
 
   if (total == 0) {
     for (int i=0;i<numRoads;i++) allocated[i] = baseGreen;
-    return;
+  } else {
+    // distribute extraPool proportionally
+    for (int i=0;i<numRoads;i++) {
+      float frac = (float)counts[i] / (float)total;
+      int extra = (int)round(frac * extraPool);
+      allocated[i] = baseGreen + extra;
+      if (allocated[i] < minGreen) allocated[i] = minGreen;
+      if (allocated[i] > maxGreen) allocated[i] = maxGreen;
+    }
   }
-  // distribute extraPool proportionally
-  int distributed = 0;
+  
+  // Debug output
+  Serial.print("Green Time Allocated: ");
   for (int i=0;i<numRoads;i++) {
-    float frac = (float)counts[i] / (float)total;
-    int extra = (int)round(frac * extraPool);
-    allocated[i] = baseGreen + extra;
-    if (allocated[i] < minGreen) allocated[i] = minGreen;
-    if (allocated[i] > maxGreen) allocated[i] = maxGreen;
-    distributed += extra;
+    Serial.print("Road ");
+    Serial.print(char('A' + i));
+    Serial.print("=");
+    Serial.print(allocated[i]);
+    Serial.print("s");
+    Serial.print(i < numRoads-1 ? ", " : "\n");
   }
-  // small correction: if rounding caused mismatch, adjust first element
-  // (keep it simple; not critical)
-  // update displays with allocated values
-  for (int i=0;i<numRoads;i++) {
-    showNumberTM(i, allocated[i]);
-  }
-}
-
-// Set lights for a road: red,yellow,green booleans (true = ON)
-void setRoadLights(int roadIdx, bool redOn, bool yellowOn, bool greenOn) {
-  // We wrote pins HIGH as OFF in setup; assume LOW = ON
-  digitalWrite(lightPins[roadIdx][0], redOn ? LOW : HIGH);
-  digitalWrite(lightPins[roadIdx][1], yellowOn ? LOW : HIGH);
-  digitalWrite(lightPins[roadIdx][2], greenOn ? LOW : HIGH);
 }
 
 // Turn all roads red
 void allRed() {
   for (int i=0;i<numRoads;i++) {
-    setRoadLights(i, true, false, false);
+    digitalWrite(lightPins[i][0], HIGH);  // RED ON
+    digitalWrite(lightPins[i][1], LOW);   // YELLOW OFF
+    digitalWrite(lightPins[i][2], LOW);   // GREEN OFF
   }
 }
 
 void loop() {
+  Serial.println("\n========== NEW TRAFFIC CYCLE ==========");
+  
   // 1) Sample traffic counts
+  Serial.println("Sampling traffic...");
   sampleCounts();
 
   // 2) Compute allocated green times
   computeAllocation();
 
-  // 3) Run traffic cycle in order
-  for (int r=0; r<numRoads; r++) {
-    int gtime = allocated[r];
-    // set this road green, others red
-    for (int i=0;i<numRoads;i++){
-      if (i == r) setRoadLights(i, false, false, true);
-      else setRoadLights(i, true, false, false);
-    }
+  // 3) Start with all roads RED
+  Serial.println("\nAll roads: RED\n");
+  allRed();
+  delay(1000);
 
-    // show countdown on the road's display, other displays show their allocated values
-    for (int sec = gtime; sec >= 1; sec--) {
-      showNumberTM(r, sec);
-      // ensure other displays show allocated (static)
-      for (int j=0;j<numRoads;j++){
-        if (j != r) showNumberTM(j, allocated[j]);
+  // 4) Run traffic cycle for each road
+  for (int r=0; r<numRoads; r++) {
+    int greenTime = allocated[r];
+    
+    Serial.println("----------------------------");
+    Serial.print("Road ");
+    Serial.print(char('A' + r));
+    Serial.println("'s Turn:");
+    
+    // Calculate total wait time for other roads (sum of remaining road times)
+    int waitTimes[numRoads];
+    for (int i=0; i<numRoads; i++) {
+      if (i == r) {
+        waitTimes[i] = 0; // Current road doesn't wait
+      } else {
+        // Calculate how long this road must wait
+        int wait = 0;
+        for (int j=r; j<numRoads; j++) {
+          if (j != i) {
+            wait += allocated[j] + yellowTime; // green time + yellow time
+          }
+        }
+        // If road already passed, add full cycle time
+        if (i < r) {
+          for (int j=0; j<numRoads; j++) {
+            wait += allocated[j] + yellowTime;
+          }
+        }
+        waitTimes[i] = wait;
+      }
+    }
+    
+    // PHASE 1: Show YELLOW on current road for 2 seconds
+    // All others show RED with countdown to their turn
+    Serial.print("Road ");
+    Serial.print(char('A' + r));
+    Serial.println(": YELLOW (2s warning)");
+    Serial.println("Other roads: RED (showing wait time)");
+    
+    for (int i=0; i<numRoads; i++) {
+      if (i == r) {
+        // Current road: YELLOW ON
+        digitalWrite(lightPins[i][0], LOW);   // RED OFF
+        digitalWrite(lightPins[i][1], HIGH);  // YELLOW ON
+        digitalWrite(lightPins[i][2], LOW);   // GREEN OFF
+      } else {
+        // Other roads: RED ON
+        digitalWrite(lightPins[i][0], HIGH);  // RED ON
+        digitalWrite(lightPins[i][1], LOW);   // YELLOW OFF
+        digitalWrite(lightPins[i][2], LOW);   // GREEN OFF
+      }
+    }
+    
+    // During yellow, update all displays
+    for (int sec = yellowTime; sec >= 1; sec--) {
+      for (int i=0; i<numRoads; i++) {
+        if (i == r) {
+          showNumberTM(i, sec); // Show yellow countdown
+        } else {
+          showNumberTM(i, waitTimes[i]); // Show wait time for other roads
+        }
       }
       delay(1000);
+      // Decrement wait times
+      for (int i=0; i<numRoads; i++) {
+        if (i != r) waitTimes[i]--;
+      }
     }
-
-    // set yellow for this road
-    setRoadLights(r, false, true, false);
-    showNumberTM(r, yellowTime);
-    delay(yellowTime * 1000);
-
-    // after yellow, set road red
-    setRoadLights(r, true, false, false);
+    
+    // PHASE 2: Show GREEN on current road
+    // All others stay RED with countdown
+    Serial.print("Road ");
+    Serial.print(char('A' + r));
+    Serial.print(": GREEN (");
+    Serial.print(greenTime);
+    Serial.println("s to pass)");
+    Serial.println("Other roads: RED (showing wait time)");
+    
+    for (int i=0; i<numRoads; i++) {
+      if (i == r) {
+        // Current road: GREEN ON
+        digitalWrite(lightPins[i][0], LOW);   // RED OFF
+        digitalWrite(lightPins[i][1], LOW);   // YELLOW OFF
+        digitalWrite(lightPins[i][2], HIGH);  // GREEN ON
+      } else {
+        // Other roads: RED ON
+        digitalWrite(lightPins[i][0], HIGH);  // RED ON
+        digitalWrite(lightPins[i][1], LOW);   // YELLOW OFF
+        digitalWrite(lightPins[i][2], LOW);   // GREEN OFF
+      }
+    }
+    
+    // During green, countdown on current road, wait time on others
+    for (int sec = greenTime; sec >= 1; sec--) {
+      for (int i=0; i<numRoads; i++) {
+        if (i == r) {
+          showNumberTM(i, sec); // Show time left to pass
+        } else {
+          showNumberTM(i, waitTimes[i]); // Show wait time
+        }
+      }
+      delay(1000);
+      // Decrement wait times
+      for (int i=0; i<numRoads; i++) {
+        if (i != r) waitTimes[i]--;
+      }
+    }
+    
+    // PHASE 3: Back to all RED
+    Serial.print("Road ");
+    Serial.print(char('A' + r));
+    Serial.println(": GREEN -> RED");
+    
+    allRed();
+    
+    // Update displays to show wait times
+    for (int i=0; i<numRoads; i++) {
+      if (waitTimes[i] > 0) {
+        showNumberTM(i, waitTimes[i]);
+      } else {
+        showNumberTM(i, 0);
+      }
+    }
+    
+    delay(500);
   }
 
-  // After full cycle loop, it repeats: at top of loop we'll sample again
+  Serial.println("\n========== CYCLE COMPLETE ==========");
 }
